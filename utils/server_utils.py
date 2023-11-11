@@ -49,8 +49,8 @@ class ServerService():
         self.select_idxs = ctx.Manager().list([0] * args.active_worker_num)
 
         self.embs_list = [torch.zeros(args.batch_size, args.emb_dim).to(self.device).share_memory_() for _ in range(args.worker_num)]
-        self.ema_embs_list = [torch.zeros(args.batch_size, args.emb_dim).to(args.device).share_memory_() for _ in range(args.worker_num)]
-        self.grad_list = [torch.zeros(args.batch_size, args.emb_dim).to(args.device).share_memory_() for _ in range(args.worker_num)]
+        self.ema_embs_list = [torch.zeros(args.batch_size, args.emb_dim).to(self.device).share_memory_() for _ in range(args.worker_num)]
+        self.grad_list = [torch.zeros(args.batch_size, args.emb_dim).to(self.device).share_memory_() for _ in range(args.worker_num)]
         self.send_mq = [ctx.Manager().Queue(args.worker_num) for _ in range(args.worker_num)]
         self.lock = ctx.Manager().Lock()
 
@@ -60,7 +60,8 @@ class ServerService():
 
         self.avg_loss_x = 0
         self.avg_loss_u = 0
-        self.sup_iters = self.args.sup_iters
+        # self.sup_iters = self.args.sup_iters
+        self.sup_iters = 80
 
 
     def load_model(self):
@@ -91,7 +92,7 @@ class ServerService():
         for p in self.t_proj_head.parameters():
             p.requires_grad_(False)
 
-        self.aggr_model = models.create_model_instance(self.args.model_type + 'Client').to(self.args.aggr_device).share_memory()
+        self.aggr_model = models.create_model_instance(self.args.model_type + 'Client').to(self.aggr_device).share_memory()
     
     def load_dataset(self):
         strain_dataset, test_dataset, train_data_partition, _ = \
@@ -118,25 +119,23 @@ class ServerService():
         # create a list of processes
         
         for i in range(self.worker_num):
-            p = ctx.Process(target=train_func, 
-                            args=(  i,
-                                    self.select_idxs,
-                                    self.args, 
-                                    self.server_sync_barrier, 
-                                    self.client_sync_barrier,
-                                    self.aggr_sync_barrier,
-                                    self.send_mq[i], 
-                                    self.embs_list[i], 
-                                    self.ema_embs_list[i], 
-                                    self.grad_list[i],       
-                                    self.status_list, 
-                                    self.upload_cost_list,
-                                    self.train_time_list, 
-                                    self.lock,
-                                    self.train_data_idxes[i],
-                                    self.aggr_model,
-                                    self.aggr_device
-                                )
+            p = ctx.Process(target=train_func,     
+                            kwargs={
+                                    "process_id":i,
+                                    "select_idxs":self.select_idxs,
+                                    "args":self.args, 
+                                    "server_sync_barrier":self.server_sync_barrier, 
+                                    "client_sync_barrier":self.client_sync_barrier,
+                                    "aggr_sync_barrier":self.aggr_sync_barrier,
+                                    "distr_model_list":self.send_mq[i], 
+                                    "embs":self.embs_list[i], 
+                                    "ema_embs":self.ema_embs_list[i], 
+                                    "grad_list":self.grad_list[i],       
+                                    "lock":self.lock,
+                                    "train_data_idxes":self.train_data_idxes[i],
+                                    "aggr_model":self.aggr_model,
+                                    "aggr_device":self.aggr_device
+                                }
                             )
             self.processes.append(p)
 
@@ -146,7 +145,7 @@ class ServerService():
 
 
     def sup_train(self, global_step, round_idx):
-        no_progress = round_idx / self.round
+        no_progress = round_idx / self.args.round
         self.lr = self.args.min_lr + 0.5 * (self.args.lr - self.args.min_lr) * (1 + np.cos(np.pi * no_progress))
         s_optimizer = optim.SGD(itertools.chain(*[self.classifier.parameters(), self.encoder.parameters(), self.proj_head.parameters()]), 
             lr=self.lr, momentum=self.args.momentum, nesterov=True, weight_decay=self.args.weight_decay)
@@ -174,7 +173,7 @@ class ServerService():
             ema_embs = self.t_encoder(ema_inputs)
             keys = self.t_proj_head(ema_embs).detach()
             
-            cr_loss = self.fcache(feats, keys, targets)
+            cr_loss = self.fcache(feats, keys, targets, True)
 
             loss = ce_loss + cr_loss
             
@@ -304,7 +303,7 @@ class ServerService():
 
         cr_mask = t_cfd.ge(self.args.threshold).long()
 
-        cr_loss = self.fcache(feats, key, t_preds, cr_mask, step)
+        cr_loss = self.fcache(feats, key, t_preds, False, cr_mask, step)
         
         loss = ce_loss + cr_loss
 
@@ -314,25 +313,25 @@ class ServerService():
         self.avg_loss_x += loss_x
         self.avg_loss_u += loss_u
         if round_idx == 0:
-            last_avg_loss_x = loss_x
-            last_avg_loss_u = loss_u
+            self.last_avg_loss_x = loss_x
+            self.last_avg_loss_u = loss_u
         elif round_idx % 10 == 0:
-            avg_loss_x /= 10
-            avg_loss_u /= 10
-            delta_loss_x = last_avg_loss_x - avg_loss_x
-            delta_loss_u = last_avg_loss_u - avg_loss_u
+            self.avg_loss_x /= 10
+            self.avg_loss_u /= 10
+            delta_loss_x = self.last_avg_loss_x - self.avg_loss_x
+            delta_loss_u = self.last_avg_loss_u - self.avg_loss_u
             
             # global updating frequency adaptation
-            if self.args.iter_decay and round_idx in self.args.miltstones:
+            if self.args.iter_decay and round_idx in self.args.milestones:
                 if abs(delta_loss_u) < self.args.pho1:
                     self.sup_iters /= 2
                 elif abs(delta_loss_u) > self.args.pho2:
                     self.sup_iters *= 2
 
-            last_avg_loss_x = avg_loss_x
-            last_avg_loss_u = avg_loss_u
-            avg_loss_x = 0
-            avg_loss_u = 0
+            self.last_avg_loss_x = self.avg_loss_x
+            self.last_avg_loss_u = self.avg_loss_u
+            self.avg_loss_x = 0
+            self.avg_loss_u = 0
 
 
     def terminate(self):

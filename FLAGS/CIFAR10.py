@@ -21,7 +21,7 @@ FLAGS.decay_rate = 0
 FLAGS.save_model = True
 
 # server supervised hyperpara
-FLAGS.stransform_type = 'strong_twice'
+FLAGS.ustransform_type = 'strong_twice'
 FLAGS.sbatch_size = 64
 FLAGS.drop_last = True
 FLAGS.ema_decay = 0.99

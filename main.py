@@ -12,7 +12,6 @@ from FLAGS import SVHN, CIFAR10, IMAGE100
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 torch.set_float32_matmul_precision('high')
-FLAGS = None
 
 def arg_parse():
     #init parameters
@@ -27,49 +26,50 @@ def arg_parse():
     args = parser.parse_args()
     
     if args.dataset == "SVHN":
-        FLAGS = SVHN.FLAGS
+        kargs = SVHN.FLAGS
     elif args.dataset == "CIFAR10":
-        FLAGS = CIFAR10.FLAGS
+        kargs = CIFAR10.FLAGS
     elif args.dataset == "IMAGE100":
-        FLAGS = IMAGE100.FLAGS
+        kargs = IMAGE100.FLAGS
     else:
         raise ValueError("Unsupported dataset: %s" % args.dataset)
     
-    FLAGS.expname = args.expname
-    FLAGS.data_pattern = args.data_pattern
+    kargs.expname = args.expname
+    kargs.data_pattern = args.data_pattern
     if args.nlabeled > 0:
-        FLAGS.labeled_num = args.nlabeled
+        kargs.labeled_num = args.nlabeled
     assert args.aworker <= args.nworker, "invalid active worker num"
-    FLAGS.worker_num = args.nworker
-    FLAGS.active_worker_num = args.aworker
-    FLAGS.gpu = args.gpu
+    kargs.worker_num = args.nworker
+    kargs.active_worker_num = args.aworker
+    kargs.gpu = args.gpu
+    return kargs
 
 
 if __name__ == '__main__':
     print(time.strftime("%H:%M:%S"))
-    arg_parse()
+    args = arg_parse()
     # setup torch.multiprocessing
     ctx = multiprocessing.get_context('forkserver')
 
-    server_service = ServerService(FLAGS, ctx)
+    server_service = ServerService(args, ctx)
     server_service.load_model()
     server_service.load_dataset()
-    server_service.launch_clients(ctx, light_client_train)
+    server_service.launch_clients(ctx, client_train_warpper)
 
     print('workers already launched!')
     
     global_step = [0]
-    for round_idx in range(FLAGS.round):
+    for round_idx in range(args.round):
         loss_x = server_service.sup_train(global_step, round_idx)
 
         server_service.model_dispatch()
 
-        server_service.semi_sfl_train()
+        loss_u = server_service.semi_sfl_train()
         
-        loss_u = server_service.collect_params()
+        server_service.collect_params()
         
         test_loss, test_acc = server_service.test()
-        print("Round [%d/%d] train loss %.4f, acc: %.4f" % (round_idx, FLAGS.round, loss_x+loss_u))
+        print("Round [%d/%d] train loss %.4f, acc: %.4f" % (round_idx, args.round, loss_x+loss_u, test_acc))
 
         server_service.system_control(round_idx, loss_x, loss_u)
     

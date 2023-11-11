@@ -16,35 +16,25 @@ from utils.gpu_mem_track import MemTracker
 
 
 class ClientTrainer():
-    def __init__(self, process_id, 
-                 select_idxs,
-                 args, 
-                 server_sync_barrier, client_sync_barrier, aggr_sync_barrier,
-                 distr_model_list, bsz_list, embs, ema_embs, grad_list,
-                 status_list, upload_cost_list, train_time_list,
-                 lock, train_data_idxes,
-                 aggr_model, aggr_device=torch.device("cuda:4")) -> None:
-        self.args = args
-        self.process_id = process_id
-        self.select_idxs = select_idxs
-        self.server_sync_barrier = server_sync_barrier
-        self.client_sync_barrier = client_sync_barrier 
-        self.aggr_sync_barrier = aggr_sync_barrier
-        self.distr_model_list = distr_model_list
-        self.bsz_list = bsz_list
-        self.embs = embs
-        self.ema_embs = ema_embs
-        self.grad = grad_list
-        self.status_list = status_list
-        self.upload_cost_list = upload_cost_list
-        self.train_time_list = train_time_list
-        self.lock = lock
-        self.train_data_idxes = train_data_idxes
-        self.aggr_model = aggr_model
-        self.aggr_device = aggr_device
+    def __init__(self, *args, **kwargs) -> None:
+        self.args = kwargs["args"]
+        self.process_id = kwargs["process_id"]
+        self.select_idxs = kwargs["select_idxs"]
+        self.server_sync_barrier = kwargs["server_sync_barrier"]
+        self.client_sync_barrier = kwargs["client_sync_barrier"]
+        self.aggr_sync_barrier = kwargs["aggr_sync_barrier"]
+        self.distr_model_list = kwargs["distr_model_list"]
+        self.embs = kwargs["embs"]
+        self.ema_embs = kwargs["ema_embs"]
+        self.grad = kwargs["grad_list"]
+        self.lock = kwargs["lock"]
+        self.train_data_idxes = kwargs["train_data_idxes"]
+        self.aggr_model = kwargs["aggr_model"]
+        self.aggr_device = kwargs["aggr_device"]
+        
 
         # init logger
-        RESULT_PATH = os.getcwd() + '/client_logs/' + args.expname + '/'
+        RESULT_PATH = os.getcwd() + '/client_logs/' + self.args.expname + '/'
 
         if not os.path.exists(RESULT_PATH):
             os.makedirs(RESULT_PATH, exist_ok=True)
@@ -52,30 +42,30 @@ class ClientTrainer():
         self.logger = logging.getLogger(os.path.basename(__file__).split('.')[0])
         self.logger.setLevel(logging.INFO)
 
-        filename = RESULT_PATH + os.path.basename(__file__).split('.')[0] + '_'+ str(int(process_id)) +'.log'
+        filename = RESULT_PATH + os.path.basename(__file__).split('.')[0] + '_'+ str(int(self.process_id)) +'.log'
         fileHandler = logging.FileHandler(filename=filename, mode='w')
         formatter = logging.Formatter("%(message)s")
         fileHandler.setFormatter(formatter)
         self.logger.addHandler(fileHandler)
         
-        self.logger.info("client_id:{}".format(process_id))
+        self.logger.info("client_id:{}".format(self.process_id))
         self.logger.info("start")
 
         # init device
-        visible_device = process_id % 4
+        visible_device = self.process_id % 4
         self.device = torch.device("cuda:%d" % visible_device if torch.cuda.is_available() else "cpu")
         
-        utrain_dataset, _ = datasets.load_datasets(args.dataset_type, transform_type=args.utransform_type)
-        unlabeled_idxes = train_data_idxes
-        num_expand_x = math.ceil(args.batch_size * 50 / len(unlabeled_idxes))
+        utrain_dataset, _ = datasets.load_datasets(self.args.dataset_type, transform_type=self.args.utransform_type)
+        unlabeled_idxes = self.train_data_idxes
+        num_expand_x = math.ceil(self.args.batch_size * 50 / len(unlabeled_idxes))
         unlabeled_idxes = np.hstack([unlabeled_idxes for _ in range(num_expand_x)])
         np.random.shuffle(unlabeled_idxes)
         unlabeled_idxes = list(unlabeled_idxes)
-        self.local_loader = datasets.create_dataloaders(utrain_dataset, batch_size=args.batch_size, selected_idxs=unlabeled_idxes, drop_last=True)
+        self.local_loader = datasets.create_dataloaders(utrain_dataset, batch_size=self.args.batch_size, selected_idxs=unlabeled_idxes, drop_last=True)
 
         self.logger.info("init loader: %d samples" % len(unlabeled_idxes))
 
-        self.encoder = create_model_instance(args.model_type + 'Client')
+        self.encoder = create_model_instance(self.args.model_type + 'Client')
         self.encoder.to(self.device)
         self.t_encoder = copy.deepcopy(self.encoder)
         for p in self.t_encoder.parameters():
@@ -90,7 +80,7 @@ class ClientTrainer():
         for iter_idx in range(self.args.local_steps):
             self.server_sync_barrier.wait()
             
-            batch_size = self.bsz_list[self.process_id]
+            batch_size = self.args.batch_size
 
             (inputs, ema_inputs), targets = next(self.local_loader)
             inputs, ema_inputs, targets = inputs[:batch_size], ema_inputs[:batch_size], targets[:batch_size]
@@ -101,12 +91,8 @@ class ClientTrainer():
             ema_embs = self.t_encoder(ema_inputs).detach()
 
             with self.lock:
-                # self.embs_list[self.process_id] = embs.detach().cpu()
-                # self.ema_embs_list[self.process_id] = ema_embs.cpu()
-
                 self.embs.copy_(embs.detach())
                 self.ema_embs.copy_(ema_embs)
-
 
             self.client_sync_barrier.wait()
             
@@ -122,6 +108,22 @@ class ClientTrainer():
             local_optim.zero_grad()
             embs.backward(grads)
             local_optim.step()     
+
+            self.client_sync_barrier.wait()
+
+            # --- waiting for server processing... ---
+        
+        return
+    
+    def noop_train(self):
+        for iter_idx in range(self.args.local_steps):
+            self.server_sync_barrier.wait()       
+
+            self.client_sync_barrier.wait()
+            
+            # --- waiting for server bp ---
+            
+            self.server_sync_barrier.wait()
 
             self.client_sync_barrier.wait()
 
@@ -144,7 +146,10 @@ class ClientTrainer():
             self.encoder.load_state_dict(global_model_dict[0])
             self.t_encoder.load_state_dict(global_model_dict[1])
 
-            self.split_train(optimizer)
+            if self.process_id in self.select_idxs:
+                self.split_train(optimizer)
+            else:
+                self.noop_train()
 
             with self.lock, torch.no_grad():
                 if self.process_id in self.select_idxs:
@@ -155,26 +160,15 @@ class ClientTrainer():
             
             self.aggr_sync_barrier.wait()
 
-
             # -- waiting for the server to aggregate global model... --
        
 
-def light_client_train(process_id, select_idxs, args, 
-                       server_sync_barrier, client_sync_barrier, aggr_sync_barrier,
-                       distr_model_list, bsz_list, embs, ema_embs, grad,
-                       loss_list, upload_cost_list, train_time_list,
-                       lock, train_data_idxes,
-                       aggr_model, aggr_device):
+def client_train_warpper(*args, **kwargs):
 
     # disable print
     blockPrint()
 
-    client_trainer = ClientTrainer(process_id, select_idxs, args, 
-                                   server_sync_barrier, client_sync_barrier, aggr_sync_barrier,
-                                   distr_model_list, bsz_list, embs, ema_embs, grad,
-                                   loss_list, upload_cost_list, train_time_list,
-                                   lock, train_data_idxes,
-                                   aggr_model, aggr_device)
+    client_trainer = ClientTrainer(*args, **kwargs)
     client_trainer.train()
 
 

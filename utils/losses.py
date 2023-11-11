@@ -6,7 +6,7 @@ import torch.nn as nn
  
 class FeatureCache(nn.Module):
     """Fixed-size queue with momentum encoder"""
-    def __init__(self, dim, K, T=0.07, F=10):
+    def __init__(self, dim, K, T=0.07, F=1):
         super(FeatureCache, self).__init__()
         self.K = K
         self.T = T
@@ -18,7 +18,7 @@ class FeatureCache(nn.Module):
         self.register_buffer("squeue_ptr", torch.zeros(1, dtype=torch.long))
         self.register_buffer("uqueue_ptr", torch.zeros(1, dtype=torch.long))
         
-        self.register_buffer("label_queue", torch.zeros(K))
+        self.register_buffer("slabel_queue", torch.zeros(K))
         self.register_buffer("ulabel_queue", torch.zeros(K))
         self.slabel_queue -= 1
         self.ulabel_queue -= 1 
@@ -72,13 +72,13 @@ class FeatureCache(nn.Module):
         self.squeue_ptr[0] = ptr
 
 
-    def forward(self, q, k, label, sup=False, cr_mask=None, step=0):
+    def forward(self, q, k, label, sup, cr_mask=None, step=0):
         if sup:
             queue_ = self.squeue.clone().detach()  # (dim, K)
             label_ = self.slabel_queue.clone().detach()
         else:
-            queue_ = torch.cat(self.uqueue, self.squeue).clone().detach()
-            label_ = torch.cat(self.ulabel_queue, self.slabel_queue).clone().detach()
+            queue_ = torch.cat([self.uqueue, self.squeue], dim=1).clone().detach()
+            label_ = torch.cat([self.ulabel_queue, self.slabel_queue]).clone().detach()
 
         queue_enqueue = torch.cat([k.T, queue_], dim=1)  # shape: (dim, (bsz+qsz))
         label_enqueue = torch.cat([label, label_], dim=0)  # bsz+qsz
@@ -111,7 +111,8 @@ class FeatureCache(nn.Module):
 
         # update memory
         if self.K > 0:
-            self._udequeue_and_enqueue(k, label, cr_mask)
+            if not sup:
+                self._udequeue_and_enqueue(k, label, cr_mask)
             if sup or step % self.F == 0:
                 self._sdequeue_and_enqueue(k, label)
         return loss.mean()

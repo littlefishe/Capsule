@@ -29,7 +29,7 @@ FLAGS.sup_iters = 50
 FLAGS.iter_decay = True
 
 # local
-FLAGS.transform_type = 'fixmatch'
+FLAGS.utransform_type = 'fixmatch'
 FLAGS.batch_size = 64
 FLAGS.local_steps = 50
 
