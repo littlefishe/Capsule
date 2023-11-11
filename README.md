@@ -21,7 +21,7 @@ Semi-SFL with Clustering Regularization
 
 [CIFAR-10](http://www.cs.toronto.edu/~kriz/cifar.html)
 
-[IMAGE-100](https://rec.ustc.edu.cn/share/09881460-806a-11ee-bcdf-af03ee393f3c)
+[IMAGE-100](https://rec.ustc.edu.cn/share/8cb6abd0-806b-11ee-8e09-13f01dde3b5b)
 
 ## start
 ```bash
