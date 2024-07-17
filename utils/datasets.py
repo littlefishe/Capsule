@@ -1,3 +1,5 @@
+import os
+import sys
 import random
 import numpy as np
 from distutils.log import error
@@ -5,6 +7,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from PIL import ImageFilter
 from utils.randaugments import RandAugmentMC
+# from make_dataset import CustomDataset
 
 class Partition(object):
 
@@ -69,6 +72,17 @@ class LabelwisePartitioner(object):
 
         label_indexes = list()
         class_len = list()
+
+        if hasattr(self.data, 'split'):
+            if self.data.split == 'unlabeled':
+                data_indexes = np.arange(len(self.data))
+                random.Random().shuffle(data_indexes)
+                sublen = len(data_indexes) // len(partition_sizes[0])
+                last_suben = len(data_indexes) - (sublen * (len(partition_sizes[0]) - 1))
+                self.partitions = [list()] + [data_indexes[i*sublen: (i+1)*sublen+last_suben] 
+                                              for i in range(len(partition_sizes[0]))]
+
+                return
         # label_indexes includes class_num lists. Each list is the set of indexs of a specific class
         try:
             for class_idx in range(len(data.classes)):
@@ -120,7 +134,14 @@ def create_dataloaders(dataset, batch_size, selected_idxs=None, shuffle=True, pi
     
     return DataLoaderHelper(dataloader)
 
-def load_datasets(dataset_type, data_path="/data", transform_type='default'):
+def load_datasets(dataset_type, data_path="zpsun/data", transform_type='default', **kwargs):
+    if os.path.exists('/data0'):
+        data_path = os.path.join('/data0', data_path)
+    elif os.path.exists('/data'):
+        data_path = os.path.join('/data', data_path)
+    else:
+        raise FileNotFoundError('Data Directory doesn not exist!')
+    
     if transform_type == 'default':
         train_transform = load_default_transform(dataset_type, train=True)
     elif transform_type == 'twice':
@@ -144,12 +165,6 @@ def load_datasets(dataset_type, data_path="/data", transform_type='default'):
         test_dataset = datasets.CIFAR10(data_path, train = False, 
                                             download = True, transform=test_transform)
 
-    elif dataset_type == 'CIFAR100':
-        train_dataset = datasets.CIFAR100(data_path, train = True,
-                                            download = True, transform=train_transform)
-        test_dataset = datasets.CIFAR100(data_path, train = False, 
-                                            download = True, transform=test_transform)
-
     elif dataset_type == 'SVHN':
         train_dataset = datasets.SVHN(data_path+'/SVHN_data', split='train',
                                             download = True, transform=train_transform)
@@ -159,6 +174,20 @@ def load_datasets(dataset_type, data_path="/data", transform_type='default'):
     elif dataset_type == 'IMAGE100':
         train_dataset = datasets.ImageFolder(data_path+'/IMAGE100/train', transform=train_transform)
         test_dataset = datasets.ImageFolder(data_path+'/IMAGE100/test', transform=test_transform)
+
+    elif dataset_type == "STL10":
+        unlabeled_dataset = datasets.STL10(root=data_path, split='unlabeled', download=True,
+                                                transform=train_transform)
+        
+        train_dataset = datasets.STL10(root=data_path, split='train', download=True,
+                                                transform=train_transform)
+        test_dataset = datasets.STL10(root=data_path, split='test', download=True,
+                                    transform=test_transform)
+        
+        if 'unlabel' in kwargs.keys() and kwargs['unlabel']:
+            return unlabeled_dataset, test_dataset
+        
+        return train_dataset, test_dataset, unlabeled_dataset
 
     return train_dataset, test_dataset
 
@@ -174,27 +203,6 @@ def load_default_transform(dataset_type, train=False):
                            transforms.ToTensor(),
                            normalize
                          ])
-        else:
-            dataset_transform = transforms.Compose([
-                            transforms.ToTensor(),
-                            normalize
-                            ])
-
-    elif dataset_type == 'CIFAR100':
-        # reference:https://github.com/weiaicunzai/pytorch-cifar100/blob/master/utils.py
-        # normalize = transforms.Normalize((0.5070751592371323, 0.48654887331495095, 0.4409178433670343), 
-        #                                             (0.2673342858792401, 0.2564384629170883, 0.27615047132568404))
-        normalize = transforms.Normalize(mean=[0.5071, 0.4867, 0.4408], 
-                                    std=[0.2675, 0.2565, 0.2761])
-        if train:
-            dataset_transform = transforms.Compose([
-                                transforms.RandomHorizontalFlip(),
-                                transforms.RandomCrop(size=32,
-                                                    padding=int(32*0.125),
-                                                    padding_mode='reflect'),
-                                transforms.ToTensor(),
-                                normalize
-                            ])
         else:
             dataset_transform = transforms.Compose([
                             transforms.ToTensor(),
@@ -218,12 +226,6 @@ def load_default_transform(dataset_type, train=False):
                             transforms.ToTensor(),
                             normalize
                             ])
-    
-    elif dataset_type == 'tinyImageNet':
-        dataset_transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize([0.4802, 0.4481, 0.3975], [0.2302, 0.2265, 0.2262]),
-        ])
 
     elif dataset_type == 'IMAGE100':
         if train:
@@ -239,8 +241,23 @@ def load_default_transform(dataset_type, train=False):
                                         transforms.ToTensor(),
                                         transforms.Normalize((0.485, 0.456, 0.406),(0.229, 0.224, 0.225))
                                     ])
-        
 
+    elif dataset_type == "STL10":
+        normalize = transforms.Normalize(mean=[0.4408, 0.4279, 0.3867],
+                                        std=[0.2683, 0.2610, 0.2687])
+
+        if train:
+            dataset_transform = transforms.Compose([
+                                    transforms.RandomCrop(96, padding=4),
+                                    transforms.RandomHorizontalFlip(),
+                                    transforms.ToTensor(),
+                                    normalize,
+                                ])
+        else:
+            dataset_transform = transforms.Compose([
+                    transforms.ToTensor(),
+                    normalize,
+                ])
     return dataset_transform
 
 
@@ -261,14 +278,16 @@ class RandTransform(object):
             hw = (32, 32)
             normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
                                             std=[0.2023, 0.1994, 0.2010])
-        elif dataset_type == 'CIFAR100':
-            hw = (32, 32)
-            normalize = transforms.Normalize(mean=[0.5071, 0.4867, 0.4408],
-                                            std=[0.2675, 0.2565, 0.2761])
+            
         elif dataset_type == 'SVHN':
             hw = (32, 32)
             normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], 
                                             std=[0.5, 0.5, 0.5])
+        elif dataset_type == "STL10":
+            hw = (96, 96)
+            normalize = transforms.Normalize(mean=[0.4408, 0.4279, 0.3867],
+                                            std=[0.2683, 0.2610, 0.2687])
+
         elif dataset_type == 'IMAGE100':
             hw = (144, 144)
             resize = transforms.Resize((144, 144))

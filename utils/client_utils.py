@@ -26,9 +26,11 @@ class ClientTrainer():
         self.distr_model_list = kwargs["distr_model_list"]
         self.embs = kwargs["embs"]
         self.ema_embs = kwargs["ema_embs"]
+        self.targets = kwargs["targets"]
         self.grad = kwargs["grad_list"]
         self.lock = kwargs["lock"]
-        self.train_data_idxes = kwargs["train_data_idxes"]
+        self.labeled_idxes = kwargs["labeled_idxes"]
+        self.unlabeled_idxes = kwargs["unlabeled_idxes"]
         self.aggr_model = kwargs["aggr_model"]
         self.aggr_device = kwargs["aggr_device"]
         
@@ -52,18 +54,30 @@ class ClientTrainer():
         self.logger.info("start")
 
         # init device
-        visible_device = self.process_id % 4
+        visible_device = self.process_id % 8
         self.device = torch.device("cuda:%d" % visible_device if torch.cuda.is_available() else "cpu")
         
-        utrain_dataset, _ = datasets.load_datasets(self.args.dataset_type, transform_type=self.args.utransform_type)
-        unlabeled_idxes = self.train_data_idxes
-        num_expand_x = math.ceil(self.args.batch_size * 50 / len(unlabeled_idxes))
-        unlabeled_idxes = np.hstack([unlabeled_idxes for _ in range(num_expand_x)])
-        np.random.shuffle(unlabeled_idxes)
-        unlabeled_idxes = list(unlabeled_idxes)
-        self.local_loader = datasets.create_dataloaders(utrain_dataset, batch_size=self.args.batch_size, selected_idxs=unlabeled_idxes, drop_last=True)
+        if self.args.dataset_type == "STL10" and self.args.client_labels > 0:
+            strainset, _, utrainset = datasets.load_datasets(self.args.dataset_type, transform_type=self.args.utransform_type)
+        else:
+            utrainset, _ = datasets.load_datasets(self.args.dataset_type, transform_type=self.args.utransform_type, unlabel=True)
+        
+        self.logger.info("init loader: %d labeled, %d unlabeled" % (len(self.labeled_idxes), len(self.unlabeled_idxes)))
 
-        self.logger.info("init loader: %d samples" % len(unlabeled_idxes))
+        if len(self.labeled_idxes) > 0:
+            lbz = self.args.ubz // (1+self.args.mu) if self.args.mu > 0 else 0
+            ubz = self.args.ubz // (1+self.args.mu) * self.args.mu if self.args.mu > 0 else self.args.ubz
+            labeled_idxes = self.expand_data_idx(lbz, self.labeled_idxes)
+            if self.args.dataset_type == "STL10":
+                self.labeled_loader = datasets.create_dataloaders(strainset, batch_size=lbz , selected_idxs=labeled_idxes, drop_last=True)
+            else:
+                self.labeled_loader = datasets.create_dataloaders(utrainset, batch_size=lbz , selected_idxs=labeled_idxes, drop_last=True)
+        else:
+            ubz = self.args.ubz
+            self.labeled_loader = None
+
+        unlabeled_idxes = self.expand_data_idx(ubz, self.unlabeled_idxes)
+        self.unlabeled_loader = datasets.create_dataloaders(utrainset, batch_size=ubz, selected_idxs=unlabeled_idxes, drop_last=True)
 
         self.encoder = create_model_instance(self.args.model_type + 'Client')
         self.encoder.to(self.device)
@@ -75,24 +89,60 @@ class ClientTrainer():
         del local_paras
         self.logger.info("complete init")
 
-
-    def split_train(self, local_optim):
+    def usplit_train(self, local_optim):
         for iter_idx in range(self.args.local_steps):
             self.server_sync_barrier.wait()
+            (inputs_s_u, inputs_w_u), _ = next(self.unlabeled_loader)
+            inputs_s_u, inputs_w_u = inputs_s_u.to(self.device), inputs_w_u.to(self.device)
             
-            batch_size = self.args.batch_size
-
-            (inputs, ema_inputs), targets = next(self.local_loader)
-            inputs, ema_inputs, targets = inputs[:batch_size], ema_inputs[:batch_size], targets[:batch_size]
-            inputs, ema_inputs, targets = inputs.to(self.device), ema_inputs.to(self.device), targets.to(self.device)
-            
-
-            embs = self.encoder(inputs)
-            ema_embs = self.t_encoder(ema_inputs).detach()
+            embs = self.encoder(inputs_s_u)
+            ema_embs = self.t_encoder(inputs_w_u).detach()
 
             with self.lock:
                 self.embs.copy_(embs.detach())
                 self.ema_embs.copy_(ema_embs)
+
+            self.client_sync_barrier.wait()
+            
+            # --- waiting for server bp ---
+            
+            self.server_sync_barrier.wait()
+
+            with self.lock:
+                grads = self.grad.to(self.device)
+
+            # client training
+
+            local_optim.zero_grad()
+            embs.backward(grads)
+            local_optim.step()     
+
+            self.client_sync_barrier.wait()
+
+            # --- waiting for server processing... ---
+        
+        return
+
+
+    def split_train(self, local_optim):
+        for iter_idx in range(self.args.local_steps):
+            self.server_sync_barrier.wait()
+            (inputs_s_x, inputs_w_x), targets = next(self.labeled_loader)
+            (inputs_s_u, inputs_w_u), _ = next(self.unlabeled_loader)
+
+            inputs_s_x, inputs_w_x = inputs_s_x.to(self.device), inputs_w_x.to(self.device)
+            inputs_s_u, inputs_w_u = inputs_s_u.to(self.device), inputs_w_u.to(self.device)
+
+
+            inputs_s = torch.cat([inputs_s_x, inputs_s_u])
+            inputs_w = torch.cat([inputs_w_x, inputs_w_u])
+            embs = self.encoder(inputs_s)
+            ema_embs = self.t_encoder(inputs_w).detach()
+
+            with self.lock:
+                self.embs.copy_(embs.detach())
+                self.ema_embs.copy_(ema_embs)
+                self.targets.copy_(targets)
 
             self.client_sync_barrier.wait()
             
@@ -131,7 +181,13 @@ class ClientTrainer():
         
         return
         
-    
+    def expand_data_idx(self, bsz, data_idxes):
+        num_expand_x = math.ceil(bsz * self.args.local_steps / len(data_idxes))
+        data_idxes = np.hstack([data_idxes for _ in range(num_expand_x)])
+        np.random.shuffle(data_idxes)
+        return list(data_idxes)
+
+
     def train(self):
         for round_idx in range(self.args.round):
             no_progress = round_idx / self.args.round
@@ -140,6 +196,9 @@ class ClientTrainer():
                 lr=lr, momentum=self.args.momentum, nesterov=True, weight_decay=self.args.weight_decay)
             self.logger.info("round-{} lr: {}".format(round_idx, optimizer.param_groups[0]['lr']))
             
+            if round_idx < self.args.pre_round:
+                continue
+            
             # -- waiting for server training... --
             self.server_sync_barrier.wait()
             global_model_dict = self.distr_model_list.get()
@@ -147,7 +206,10 @@ class ClientTrainer():
             self.t_encoder.load_state_dict(global_model_dict[1])
 
             if self.process_id in self.select_idxs:
-                self.split_train(optimizer)
+                if len(self.labeled_idxes) > 0:
+                    self.split_train(optimizer)
+                else:
+                    self.usplit_train(optimizer)
             else:
                 self.noop_train()
 

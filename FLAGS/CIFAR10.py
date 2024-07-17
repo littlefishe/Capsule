@@ -10,39 +10,40 @@ FLAGS.worker_num = 30
 FLAGS.active_worker_num = 10
 FLAGS.round = 1000
 FLAGS.labeled_num = 4000
+FLAGS.client_labels = 0
+FLAGS.mu = 7
 FLAGS.expand = True
+FLAGS.pre_round = 0
 
 # global
 FLAGS.lr = 0.02
 FLAGS.min_lr = 0.005
 FLAGS.momentum = 0.9
 FLAGS.weight_decay = 5e-4
-FLAGS.decay_rate = 0
 FLAGS.save_model = True
 
 # server supervised hyperpara
-FLAGS.ustransform_type = 'strong_twice'
-FLAGS.sbatch_size = 64
+FLAGS.stransform_type = 'strong_twice'
+FLAGS.sbz = 64
 FLAGS.drop_last = True
 FLAGS.ema_decay = 0.99
-FLAGS.sup_iters = 50
-FLAGS.iter_decay = False
+FLAGS.global_steps = 100
+
+# alg
+FLAGS.control = True
+FLAGS.alpha = 1.5
+FLAGS.beta = 8
 
 # local
 FLAGS.utransform_type = 'fixmatch'
-FLAGS.batch_size = 64
+FLAGS.ubz = 64
 FLAGS.local_steps = 50
 
 # cr
-FLAGS.uqueue_size = 64*10
-FLAGS.utemperature = 0.2
+FLAGS.queue_size = 1024
+FLAGS.temperature = 0.2
 FLAGS.threshold = 0.95
 FLAGS.emb_dim = 4096
-FLAGS.proj_type = 'mlp'
+FLAGS.proj_type = 'mlp' # 'mlp'
 FLAGS.proj_dim = 128
-FLAGS.alpha = 0.7
-
-# alg
-FLAGS.rho_1 = 0.01
-FLAGS.rho_2 = 0.05
-FLAGS.milestones = [150, 250, 400, 600, 700]
+FLAGS.clear_cache = False

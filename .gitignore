@@ -1,0 +1,6 @@
+__pycache__/
+server_logs/
+client_logs/
+board/
+plot.py
+standalone.py

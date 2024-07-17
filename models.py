@@ -16,6 +16,10 @@ def create_model_instance(model_type, class_num=10):
         model = VGG16ImageClient()
     elif model_type == 'VGG16ImageServer':
         model = VGG16ImageServer()
+    elif model_type == 'VGG13Client':
+        model = VGG13Client()
+    elif model_type == 'VGG13Server':
+        model = VGG13Server()
     elif model_type == 'CNNClient':
         model = CNNClient()
     elif model_type == 'CNNServer':
@@ -227,6 +231,76 @@ class VGG16ImageServer(nn.Module):
         return F.log_softmax(x, dim=1)
 
 
+class VGG13Client(nn.Module):
+    def __init__(self):
+        super(VGG13Client, self).__init__()
+        self.features = nn.Sequential(
+            
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2,2),
+            
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3,padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2,2),
+            
+            nn.Conv2d(128, 256, kernel_size=3,padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3,padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2,2),
+            
+            nn.Conv2d(256, 512, kernel_size=3,padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3,padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2,2,padding=1),
+            
+            nn.Conv2d(512, 512, kernel_size=3,padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3,padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2,2),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), 512*9)
+        return x
+        
+
+class VGG13Server(nn.Module):
+    def __init__(self):
+        super(VGG13Server, self).__init__()  
+        self.classifier = nn.Sequential(
+            nn.Linear(512*9, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(),
+            nn.Linear(4096, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(),
+            nn.Linear(4096, 10)
+        )
+
+    def forward(self, x):
+        x = self.classifier(x)
+        return F.log_softmax(x, dim=1)
+        
+
 class CNNClient(nn.Module):
     def __init__(self):
         super(CNNClient, self).__init__()
@@ -272,6 +346,8 @@ class ProjectionHead(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(dim_in, feat_dim)
             )
+        else:
+            self.head = nn.Identity()
     
     def forward(self, feat):
         feat = F.normalize(self.head(feat), dim=1)

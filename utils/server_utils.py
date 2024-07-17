@@ -7,6 +7,8 @@ import torch.optim as optim
 import numpy as np
 import models
 import math
+import gc
+import time
 from utils.losses import *
 from utils import datasets
 from utils.data import partition_data
@@ -34,7 +36,6 @@ class ServerService():
     def __init__(self, args, ctx) -> None:
         self.args = args
         self.device = torch.device("cuda:%s" % args.gpu if torch.cuda.is_available() else "cpu")
-        self.aggr_device = torch.device("cuda:0")
         self.worker_num = args.worker_num
         self.active_num = args.active_worker_num
 
@@ -48,20 +49,26 @@ class ServerService():
 
         self.select_idxs = ctx.Manager().list([0] * args.active_worker_num)
 
-        self.embs_list = [torch.zeros(args.batch_size, args.emb_dim).to(self.device).share_memory_() for _ in range(args.worker_num)]
-        self.ema_embs_list = [torch.zeros(args.batch_size, args.emb_dim).to(self.device).share_memory_() for _ in range(args.worker_num)]
-        self.grad_list = [torch.zeros(args.batch_size, args.emb_dim).to(self.device).share_memory_() for _ in range(args.worker_num)]
+        self.embs_list = [torch.zeros(args.ubz, args.emb_dim).to(self.device).share_memory_() for _ in range(args.worker_num)]
+        self.ema_embs_list = [torch.zeros(args.ubz, args.emb_dim).to(self.device).share_memory_() for _ in range(args.worker_num)]
+        
+        self.lbz = args.ubz // (1+self.args.mu) if self.args.mu > 0 else 0
+        self.targets_list = [torch.zeros(self.lbz).to(self.device).share_memory_() for _ in range(args.worker_num)]
+        self.grad_list = [torch.zeros(args.ubz, args.emb_dim).to(self.device).share_memory_() for _ in range(args.worker_num)]
         self.send_mq = [ctx.Manager().Queue(args.worker_num) for _ in range(args.worker_num)]
         self.lock = ctx.Manager().Lock()
 
         # self.scaler = GradScaler()
-        self.batch_size = self.args.batch_size
+        self.batch_size = self.args.ubz
         self.processes = []
 
-        self.avg_loss_x = 0
-        self.avg_loss_u = 0
-        # self.sup_iters = self.args.sup_iters
-        self.sup_iters = 80
+        self.past_xloss = []
+        self.past_uloss = []
+        self.past_lr = []
+        self.past_xstep = []
+        self.past_ustep = []
+        self.global_steps = self.args.global_steps
+        self.nlabeled = self.args.labeled_num
 
 
     def load_model(self):
@@ -73,9 +80,7 @@ class ServerService():
         self.encoder.to(self.device)
         self.proj_head.to(self.device)
 
-        self.aggr_classifier = models.create_model_instance(self.args.model_type + 'Server').to(self.aggr_device).share_memory()
-        self.aggr_proj_head = models.ProjectionHead(self.args.proj_type, dim_in=self.args.emb_dim, feat_dim=self.args.proj_dim).to(self.aggr_device).share_memory()
-        self.fcache = FeatureCache(self.args.proj_dim, self.args.uqueue_size, self.args.utemperature).to(self.device).share_memory()
+        self.fcache = FeatureCache(self.args.proj_dim, self.args.queue_size, self.args.temperature).to(self.device).share_memory()
 
         self.t_classifier = copy.deepcopy(self.classifier)
         self.t_encoder = copy.deepcopy(self.encoder)
@@ -92,28 +97,57 @@ class ServerService():
         for p in self.t_proj_head.parameters():
             p.requires_grad_(False)
 
-        self.aggr_model = models.create_model_instance(self.args.model_type + 'Client').to(self.aggr_device).share_memory()
-    
+        self.aggr_model = models.create_model_instance(self.args.model_type + 'Client').to(self.device).share_memory()
+        bottom_paras = torch.nn.utils.parameters_to_vector(self.encoder.parameters()).detach() 
+        top_paras = torch.nn.utils.parameters_to_vector(self.classifier.parameters()).detach()
+        print("bottom model: %.4f MB, top model: %.4f MB" % 
+                         (bottom_paras.nelement()*4/1024/1024, top_paras.nelement()*4/1024/1024))
     def load_dataset(self):
-        strain_dataset, test_dataset, train_data_partition, _ = \
+        sdataset, test_dataset, data_partition, udataset, labeled_partition = \
             partition_data(self.args.dataset_type, self.args.data_pattern, self.args.worker_num, 
-                            n_labeled=self.args.labeled_num, transform_type=self.args.stransform_type)
+                            nlabeled=self.args.labeled_num, transform_type=self.args.stransform_type,
+                            client_labels=self.args.client_labels)
 
-        print('data has been partitioned!')
         self.test_loader = datasets.create_dataloaders(test_dataset, batch_size=128, shuffle=False)
 
-        labeled_idx = train_data_partition.use(0)
+        # data partition for clients
+        if self.args.client_labels > 0:
+            if self.args.dataset_type == 'STL10':
+                if self.args.mu == 0:
+                    self.labeled_idxes = [[]] * self.args.worker_num
+                else:
+                    self.labeled_idxes = [labeled_partition.use(worker_idx + 1) for worker_idx in range(self.args.worker_num)]
+                self.unlabeled_idxes = [data_partition.use(worker_idx + 1) for worker_idx in range(self.args.worker_num)]
+            else:
+                self.labeled_idxes = [data_partition.use(worker_idx + 1) for worker_idx in range(self.args.worker_num)]
+                self.unlabeled_idxes = [data_partition.use(self.worker_num + worker_idx + 1) for worker_idx in range(self.args.worker_num)]
+        else:
+            self.labeled_idxes = [[]] * self.args.worker_num
+            self.unlabeled_idxes = [data_partition.use(worker_idx + 1) for worker_idx in range(self.args.worker_num)]
+
+        # partition for server
+        if self.args.labeled_num > 0:
+            labeled_idx = data_partition.use(0)
+            self.ndataset = len(sdataset)
+        # for stl-10
+        else:
+            if self.args.client_labels > 0:
+                labeled_idx = labeled_partition.use(0)
+            else:
+                labeled_idx = list(range(len(sdataset)))
+            self.nlabeled = len(sdataset)
+            self.ndataset = len(sdataset) + len(udataset)
+
         if self.args.expand:
-            num_expand_x = math.ceil(self.args.sbatch_size * self.args.sup_iters / self.args.labeled_num)
+            num_expand_x = math.ceil(self.args.sbz * self.args.global_steps / len(labeled_idx))
             labeled_idx = np.hstack([labeled_idx for _ in range(num_expand_x)])
-            np.random.shuffle(labeled_idx)
-            labeled_idx = list(labeled_idx)
-        self.strain_loader = datasets.create_dataloaders(strain_dataset, batch_size=self.args.sbatch_size, 
-            selected_idxs=labeled_idx, drop_last=self.args.drop_last)
+            
+        np.random.shuffle(labeled_idx)
 
-        # send init params
-        self.train_data_idxes = [train_data_partition.use(worker_idx + 1) for worker_idx in range(self.args.worker_num)]
-
+        self.strain_loader = datasets.create_dataloaders(sdataset, batch_size=self.args.sbz, 
+            selected_idxs=list(labeled_idx), drop_last=self.args.drop_last)
+        
+        print('server labels: %d' % (self.nlabeled - self.args.client_labels))
 
     def launch_clients(self, ctx, train_func):
         # create a list of processes
@@ -130,11 +164,13 @@ class ServerService():
                                     "distr_model_list":self.send_mq[i], 
                                     "embs":self.embs_list[i], 
                                     "ema_embs":self.ema_embs_list[i], 
+                                    "targets":self.targets_list[i], 
                                     "grad_list":self.grad_list[i],       
                                     "lock":self.lock,
-                                    "train_data_idxes":self.train_data_idxes[i],
+                                    "labeled_idxes":self.labeled_idxes[i],
+                                    "unlabeled_idxes":self.unlabeled_idxes[i],
                                     "aggr_model":self.aggr_model,
-                                    "aggr_device":self.aggr_device
+                                    "aggr_device":self.device
                                 }
                             )
             self.processes.append(p)
@@ -156,13 +192,12 @@ class ServerService():
         loss_x = 0.
         local_steps = 0
 
-        ema_decay = self.args.ema_decay ** (self.sup_iters / self.args.sup_iters)
+        # ema_decay = self.args.ema_decay ** (self.global_steps / self.args.global_steps)
+        ema_decay = self.args.ema_decay
 
-        for i in range(self.args.sup_iters):
+        for i in range(self.global_steps):
             (inputs, ema_inputs), targets = next(self.strain_loader)
             inputs, ema_inputs, targets = inputs.to(self.device), ema_inputs.to(self.device), targets.to(self.device)
-            
-            s_optimizer.zero_grad()
            
             embs = self.encoder(inputs)
             outputs = self.classifier(embs)
@@ -173,7 +208,7 @@ class ServerService():
             ema_embs = self.t_encoder(ema_inputs)
             keys = self.t_proj_head(ema_embs).detach()
             
-            cr_loss = self.fcache(feats, keys, targets, True)
+            cr_loss = self.fcache(feats, keys, targets)
 
             loss = ce_loss + cr_loss
             
@@ -190,6 +225,8 @@ class ServerService():
             update_average(self.t_proj_head, self.proj_head, global_step[0], ema_decay)
 
         loss_x /= local_steps
+        if self.args.clear_cache:
+            self.fcache.clear()
         # self.fcache.clear()
         return loss_x.item()
     
@@ -209,22 +246,31 @@ class ServerService():
         for i in range(len(_select_idxs)):
             self.select_idxs[i] = _select_idxs[i]
 
+        duration = [0] * 5
         for step_idx in range(self.args.local_steps):
+            start = time.time()
             self.server_sync_barrier.wait()
                    
             # --- waiting for client split fp ... ---
 
             self.client_sync_barrier.wait()
+            duration[0] += time.time() - start
+
 
             # --- server bp ----          
-            
+            start = time.time()
             self.xembs_list = torch.cat([embs.clone().detach() for i, embs in enumerate(self.embs_list) if i in self.select_idxs], dim=0)
             self.xema_embs_list = torch.cat([ema_embs.clone().detach() for i, ema_embs in enumerate(self.ema_embs_list) if i in self.select_idxs], dim=0)
             
             sum_bsz = self.batch_size * self.active_num
 
             u_optimizer.zero_grad()
-            loss_u_i, p_i = self.server_update(step_idx)
+
+            if self.args.client_labels and self.args.mu > 0:
+                loss_u_i, p_i = self.server_update(step_idx)
+            else:
+                loss_u_i, p_i = self.userver_update(step_idx)
+
             loss_u_i.backward()
 
             bsz_s = 0
@@ -232,25 +278,32 @@ class ServerService():
                 if i in self.select_idxs:
                     self.grad_list[i][:self.batch_size].copy_(self.xembs_list.grad[bsz_s: bsz_s + self.batch_size] * sum_bsz / self.batch_size)
                     bsz_s += self.batch_size
-          
+
+            # nn.utils.clip_grad_norm_(self.classifier.parameters(), 5)
             u_optimizer.step()
             loss_u += loss_u_i.item()
             p_num += p_i
 
+            duration[1] += time.time() - start
+            start = time.time()
             self.server_sync_barrier.wait()
 
             # --- waiting for client bp ---
 
             self.client_sync_barrier.wait()
-            self.fcache.clear()
-        
+            duration[2] += time.time() - start
+
+        # if self.args.clear_cache:
+        #     self.fcache.clear()
+
+        self.fcache.clear()
         loss_u /= self.args.local_steps
         
         # --- waiting for client aggregation... ---
 
         self.aggr_sync_barrier.wait()
 
-        return loss_u
+        return loss_u, duration
 
 
     
@@ -267,9 +320,6 @@ class ServerService():
 
         # prepare for aggregation
         init_model_dict(self.aggr_model)
-        self.aggr_classifier.load_state_dict(self.classifier.state_dict())
-        self.aggr_proj_head.load_state_dict(self.proj_head.state_dict())
-
         self.server_sync_barrier.wait()
 
     
@@ -285,7 +335,7 @@ class ServerService():
         
 
 
-    def server_update(self, step):
+    def userver_update(self, step):
         # retain gradients for clients    
         self.xembs_list.requires_grad = True
         
@@ -303,45 +353,93 @@ class ServerService():
 
         cr_mask = t_cfd.ge(self.args.threshold).long()
 
-        cr_loss = self.fcache(feats, key, t_preds, False, cr_mask, step)
+        cr_loss = self.fcache(feats, key, t_preds, cr_mask)
+        
+        loss = ce_loss + cr_loss
+
+        return loss, mask.sum()
+    
+
+    def server_update(self, step):
+        # retain gradients for clients    
+        self.xembs_list.requires_grad = True
+        
+        outputs = self.classifier(self.xembs_list)
+        t_outputs = self.t_classifier(self.xema_embs_list).detach()
+        
+        t_logits = torch.softmax(t_outputs, dim=-1)
+        t_cfd, t_preds = torch.max(t_logits, dim=-1)
+
+        mask = t_cfd.ge(self.args.threshold)
+
+        s = 0
+        for i in range(self.worker_num):
+            if i in self.select_idxs:
+                t_preds[s : s+self.lbz].copy_(self.targets_list[i])
+                mask[s : s+self.lbz].fill_(1)
+                s+=self.batch_size
+
+        ce_loss = (F.cross_entropy(outputs, t_preds, reduction='none') * mask.float()).mean() 
+
+        feats = self.proj_head(self.xembs_list)
+        key = self.t_proj_head(self.xema_embs_list).detach()
+
+        cr_loss = self.fcache(feats, key, t_preds, mask)
         
         loss = ce_loss + cr_loss
 
         return loss, mask.sum()
 
-    def system_control(self, round_idx, loss_x, loss_u):
-        self.avg_loss_x += loss_x
-        self.avg_loss_u += loss_u
-        if round_idx == 0:
-            self.last_avg_loss_x = loss_x
-            self.last_avg_loss_u = loss_u
-        elif round_idx % 10 == 0:
-            self.avg_loss_x /= 10
-            self.avg_loss_u /= 10
-            delta_loss_x = self.last_avg_loss_x - self.avg_loss_x
-            delta_loss_u = self.last_avg_loss_u - self.avg_loss_u
-            
-            # global updating frequency adaptation
-            if self.args.iter_decay and round_idx in self.args.milestones:
-                if abs(delta_loss_u) < self.args.pho1:
-                    self.sup_iters /= 2
-                elif abs(delta_loss_u) > self.args.pho2:
-                    self.sup_iters *= 2
 
-            self.last_avg_loss_x = self.avg_loss_x
-            self.last_avg_loss_u = self.avg_loss_u
-            self.avg_loss_x = 0
-            self.avg_loss_u = 0
+    def system_control(self, round_idx, loss_x, loss_u):
+        # if round_idx in [100, 200, 300, 400]:
+        # if round_idx in range(300, 600+1, 100):
+        #     self.global_steps /= 2
+        #     self.global_steps = round(self.global_steps)
+
+        self.past_xloss.append(loss_x)
+        self.past_uloss.append(loss_u)
+        self.past_lr.append(self.lr)
+        self.past_xstep.append(self.global_steps)
+        self.past_ustep.append(self.args.local_steps)
+
+        if not (round_idx + 1) % 100:
+            w = 10
+            xlosses = np.array(self.past_xloss[-10*(w+1):])
+            ulosses = np.array(self.past_uloss[-10*(w+1):])
+            lrs = np.array(self.past_lr[-10*(w+1):])
+            xsteps = np.array(self.past_xstep[-10*(w+1):])
+            usteps = np.array(self.past_ustep[-10*(w+1):])
+         
+            # (11)
+            xm = np.mean(xlosses.reshape(-1, w), axis=1)
+            um = np.mean(ulosses.reshape(-1, w), axis=1)
+            lrm = np.mean(lrs.reshape(-1, w), axis=1)
+            xstepm = np.mean(xsteps.reshape(-1, w), axis=1)
+            ustepm = np.mean(usteps.reshape(-1, w), axis=1)
+
+            # (10)
+            dx = (xm[:-1] - xm[1:]) / lrm[:-1] / xstepm[:-1]
+            du = (um[:-1] - um[1:]) / lrm[:-1] / ustepm[:-1]
+
+            ratio = np.mean(du - dx >= 1e-5)
+
+            if self.args.control and ratio >= 0.5:
+                self.global_steps /= self.args.alpha
+                self.global_steps = round(max(self.global_steps,
+                                    self.args.beta * self.args.local_steps * (self.nlabeled - self.args.client_labels) / self.ndataset))
+            print(" | R %.4f" % ratio, end='')
 
 
     def terminate(self):
         # wait for all processes to finish
         for p in self.processes:
             p.join()
-        
-    def test(self):
-        self.encoder.eval()
-        self.classifier.eval()
+        gc.collect()
+
+    def test(self, models):
+        for model in models:
+            model.eval()
         if hasattr(self.test_loader, 'loader'):
             self.test_loader = self.test_loader.loader
         test_loss = 0.0
@@ -354,9 +452,8 @@ class ServerService():
 
                 data, target = data.to(self.device), target.to(self.device)
 
-
-                features = self.t_encoder(data)
-                output = self.t_classifier(features)
+                features = models[0](data)
+                output = models[1](features)
             
                 # sum up batch loss
                 loss_func = nn.CrossEntropyLoss(reduction='sum') 
@@ -368,9 +465,16 @@ class ServerService():
                 total += target.size(0)
 
         test_loss /= total
-        test_accuracy = np.float(1.0 * correct / total)
+        test_accuracy = 1.0 * correct / total
 
         return test_loss, test_accuracy
+
+        
+    def test_tea(self):
+        return self.test([self.t_encoder, self.t_classifier])
+
+    def test_stu(self):
+        return self.test([self.encoder, self.classifier])
 
 
 def init_model_dict(model):

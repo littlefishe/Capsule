@@ -16,7 +16,7 @@ def non_iid_partition(ratio, worker_num=10):
 
 def dirichlet_partition(dataset_type:str, alpha: float, worker_num: int, nclasses: int):
     partition_sizes = []
-    filepath = '../data_partition/%s_dir%s.npy' % (dataset_type, alpha)
+    filepath = '../data_partition_%d/%s_dir%s.npy' % (worker_num, dataset_type, alpha)
     if os.path.exists(filepath):
         partition_sizes = np.load(filepath)
     else:
@@ -30,78 +30,71 @@ def dirichlet_partition(dataset_type:str, alpha: float, worker_num: int, nclasse
     return partition_sizes
 
 
-def partition_data(dataset_type, data_pattern, worker_num=10, n_labeled=0., transform_type='default'):
-    train_dataset, test_dataset = datasets.load_datasets(dataset_type, transform_type=transform_type)
-    labeled_ratio = n_labeled / len(train_dataset)
-    if dataset_type in ['CIFAR100', 'IMAGE100']:
+def partition_data(dataset_type, data_pattern, worker_num=10, nlabeled=0., transform_type='default', client_labels=0):
+    if dataset_type == 'STL10':
+        trainset, testset, unlabeledset = datasets.load_datasets(
+            dataset_type, transform_type=transform_type)
+        nlabeled = len(trainset)
+    else:
+        trainset, testset = datasets.load_datasets(dataset_type, transform_type=transform_type)
+        unlabeledset = trainset
+
+    labeled_ratio = nlabeled / len(trainset)
+
+    if dataset_type == 'IMAGE100':
         nclasses = 100
-    elif dataset_type in ['CIFAR10', 'SVHN']:
+    elif dataset_type in ['CIFAR10', 'SVHN', 'STL10']:
         nclasses = 10
     else:
         raise ValueError('Unsupported dataset type')
     
+        
     if data_pattern == 0:  # iid  
-
-        partition_sizes = np.concatenate([np.ones((nclasses, 1)) * labeled_ratio, 
-                                    np.ones((nclasses, worker_num)) * (1.-labeled_ratio)/worker_num, 
-                                    ], axis=1)
+        partition_sizes = np.ones((nclasses, worker_num)) / worker_num
 
     elif data_pattern == 1:  # dir-1.0
         print('Dirichlet partition 1.0')
         partition_sizes = dirichlet_partition(dataset_type, 1.0, worker_num, nclasses)
-        partition_sizes = np.concatenate([np.ones((nclasses, 1)) * labeled_ratio, 
-                                    partition_sizes * (1.-labeled_ratio), 
-                                    ], axis=1)
 
     elif data_pattern == 2:  # dir-0.5
         print('Dirichlet partition 0.5')
         partition_sizes = dirichlet_partition(dataset_type, 0.5, worker_num, nclasses)
-        partition_sizes = np.concatenate([np.ones((nclasses, 1)) * labeled_ratio, 
-                                    partition_sizes * (1.-labeled_ratio), 
-                                    ], axis=1)
 
     elif data_pattern == 3:  # dir-0.1
         print('Dirichlet partition 0.1')
         partition_sizes = dirichlet_partition(dataset_type, 0.1, worker_num, nclasses)
-        partition_sizes = np.concatenate([np.ones((nclasses, 1)) * labeled_ratio, 
-                                    partition_sizes * (1.-labeled_ratio), 
-                                    ], axis=1)
-    
+
     elif data_pattern == 4:  # dir-0.05
         print('Dirichlet partition 0.05')
         partition_sizes = dirichlet_partition(dataset_type, 0.05, worker_num, nclasses)
-        partition_sizes = np.concatenate([np.ones((nclasses, 1)) * labeled_ratio, 
-                                    partition_sizes * (1.-labeled_ratio), 
-                                    ], axis=1)
-        
+
     elif data_pattern == 5:  # dir-0.01
         print('Dirichlet partition 0.01')
         partition_sizes = dirichlet_partition(dataset_type, 0.01, worker_num, nclasses)
-        partition_sizes = np.concatenate([np.ones((nclasses, 1)) * labeled_ratio, 
-                                    partition_sizes * (1.-labeled_ratio), 
-                                    ], axis=1)
         
-    elif data_pattern == 6:  # k=2  cifar-10
-        partition_sizes = [ [1.0, 0.0, 0.0, 0.0, 0.0],
-                            [1.0, 0.0, 0.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0, 0.0, 0.0],
-                            [0.0, 0.0, 1.0, 0.0, 0.0],
-                            [0.0, 0.0, 1.0, 0.0, 0.0],
-                            [0.0, 0.0, 0.0, 1.0, 0.0],
-                            [0.0, 0.0, 0.0, 1.0, 0.0],
-                            [0.0, 0.0, 0.0, 0.0, 1.0],
-                            [0.0, 0.0, 0.0, 0.0, 1.0],
-                            ]
-        partition_sizes = np.concatenate([partition_sizes] * (worker_num // 5), axis=1)
-        partition_sizes = np.concatenate([np.ones((nclasses, 1)), partition_sizes], axis=1)
-        partition_sizes[:, 0] *= labeled_ratio
-        partition_sizes[:, 1:] *= (1-labeled_ratio) / (worker_num // 5)
 
-    train_data_partition = datasets.LabelwisePartitioner(
-        train_dataset, partition_sizes=partition_sizes)
+    if dataset_type != 'STL10':
+        if client_labels:
+            partition_sizes = np.concatenate([
+                np.ones((nclasses, 1)) * (nlabeled - client_labels) / len(trainset) , 
+                np.ones((nclasses, worker_num)) * (client_labels / worker_num) / len(trainset),
+                partition_sizes * (1.-labeled_ratio)], axis=1)
+        else:
+            partition_sizes = np.concatenate([np.ones((nclasses, 1)) * labeled_ratio, 
+                                partition_sizes * (1.-labeled_ratio), 
+                                ], axis=1)
 
-    test_data_partition = datasets.LabelwisePartitioner(
-        test_dataset, partition_sizes=np.ones((nclasses, 10)) * (1 / 10))
+    partition = datasets.LabelwisePartitioner(
+        unlabeledset, partition_sizes=partition_sizes)
+    
+    if dataset_type == 'STL10' and client_labels > 0:
+        partition_sizes = np.concatenate([
+                                    np.ones((nclasses, 1)) * (nlabeled-client_labels) / nlabeled, 
+                                    partition_sizes * client_labels / nlabeled], axis=1)
+        labeled_partition = datasets.LabelwisePartitioner(
+            trainset, partition_sizes=partition_sizes)
+    else:
+        labeled_partition = None
 
-    return train_dataset, test_dataset, train_data_partition, test_data_partition
+
+    return trainset, testset, partition, unlabeledset, labeled_partition
